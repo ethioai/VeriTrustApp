@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# VeriTrust Security
+*.pem
+issuer_private.pem
+*.pdf
