@@ -1,0 +1,108 @@
+import os, json, base64, canonicaljson, qrcode
+from fastapi import FastAPI, Response, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
+from io import BytesIO
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors
+from reportlab.lib.utils import ImageReader
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+KEY_FILE = "issuer_private.pem"
+INSTITUTION = "FEDERAL INSTITUTE OF TECHNOLOGY"
+
+# Setup Cryptographic Keys
+if not os.path.exists(KEY_FILE):
+    priv_key = ed25519.Ed25519PrivateKey.generate()
+    with open(KEY_FILE, "wb") as f:
+        f.write(priv_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+
+def get_keys():
+    with open(KEY_FILE, "rb") as f:
+        priv = serialization.load_pem_private_key(f.read(), password=None)
+    return priv, priv.public_key().public_bytes_raw().hex()
+
+class Credential(BaseModel):
+    name: str
+    major: str
+    year: int
+    gpa: float
+
+@app.post("/issue")
+async def issue_certificate(c: Credential):
+    try:
+        priv, pub_hex = get_keys()
+        
+        # 1. Prepare and Canonicalize Student Data
+        student_data = {
+            "name": c.name,
+            "major": c.major,
+            "year": c.year,
+            "gpa": c.gpa
+        }
+        
+        # 2. Cryptographic Signing (RFC 8785)
+        canonical_bytes = canonicaljson.encode_canonical_json(student_data)
+        signature = base64.b64encode(priv.sign(canonical_bytes)).decode()
+        
+        # 3. Create Envelope for QR Code
+        envelope = {
+            "d": student_data,      # The Data
+            "s": signature,         # The Digital Signature
+            "p": pub_hex,           # The Institutional Public Key
+            "i": INSTITUTION        # The Issuer Name
+        }
+        qr_payload = base64.b64encode(json.dumps(envelope).encode()).decode()
+
+        # 4. Generate Formal PDF
+        buffer = BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=landscape(A4))
+        w, h = landscape(A4)
+        
+        # UI/Design for Diploma
+        pdf.setStrokeColor(colors.black)
+        pdf.setLineWidth(3)
+        pdf.rect(20, 20, w-40, h-40)
+        
+        pdf.setFont("Helvetica-Bold", 34)
+        pdf.drawCentredString(w/2, h-120, INSTITUTION)
+        
+        pdf.setFont("Helvetica", 18)
+        pdf.drawCentredString(w/2, h-160, "Official Digital Academic Record")
+        
+        pdf.setFont("Helvetica-Bold", 28)
+        pdf.drawCentredString(w/2, h/2, c.name)
+        
+        pdf.setFont("Helvetica", 20)
+        pdf.drawCentredString(w/2, h/2 - 40, f"Bachelor of {c.major}")
+        pdf.drawCentredString(w/2, h/2 - 80, f"Class of {c.year} | GPA: {c.gpa}")
+
+        # Embed Cryptographic QR Code
+        qr = qrcode.make(qr_payload)
+        qr_buf = BytesIO()
+        qr.save(qr_buf, format='PNG')
+        qr_buf.seek(0)
+        pdf.drawImage(ImageReader(qr_buf), w-180, 50, 130, 130)
+        
+        pdf.setFont("Courier", 7)
+        pdf.drawString(50, 45, f"SIGNATURE_HASH: {signature}")
+        pdf.drawString(50, 35, "VERITRUST OFFLINE PROTOCOL VERIFIED - SECURED VIA ED25519")
+
+        pdf.showPage()
+        pdf.save()
+        return Response(content=buffer.getvalue(), media_type="application/pdf")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
